@@ -1,0 +1,522 @@
+from fastapi import FastAPI, Query
+from pydantic import BaseModel
+import ssl
+import socket
+from datetime import datetime
+from typing import Optional, Dict, Any
+import httpx
+from urllib.parse import urlparse
+import dns.resolver
+import dns.dnssec
+import dns.reversename
+import dns.zone
+import dns.query
+import dns.exception
+import whois
+from fastapi import HTTPException
+
+app = FastAPI(title="Network Utilities Service")
+
+# ---------- Models ----------
+
+class CertificateCheckResult(BaseModel):
+    ok: bool
+    hostname: str
+    port: int
+    not_before: Optional[datetime] = None
+    not_after: Optional[datetime] = None
+    days_until_expiry: Optional[int] = None
+    subject: Optional[Dict[str, Any]] = None
+    issuer: Optional[Dict[str, Any]] = None
+    san: Optional[list] = None
+    error: Optional[str] = None
+
+
+class HSTSCheckResult(BaseModel):
+    ok: bool
+    url: str
+    hsts_present: bool
+    max_age: Optional[int] = None
+    include_subdomains: bool = False
+    preload: bool = False
+    raw_header: Optional[str] = None
+    error: Optional[str] = None
+
+
+class RedirectCheckResult(BaseModel):
+    ok: bool
+    http_url: str
+    redirected: bool
+    final_url: Optional[str] = None
+    status_code: Optional[int] = None
+    redirect_chain: Optional[list] = None
+    error: Optional[str] = None
+
+
+# ---------- Helpers ----------
+
+def get_certificate(hostname: str, port: int = 443) -> CertificateCheckResult:
+    ctx = ssl.create_default_context()
+    # require valid cert
+    ctx.check_hostname = True
+    ctx.verify_mode = ssl.CERT_REQUIRED
+
+    try:
+        with socket.create_connection((hostname, port), timeout=10) as sock:
+            with ctx.wrap_socket(sock, server_hostname=hostname) as ssock:
+                cert = ssock.getpeercert()
+
+        if cert is None:
+            raise Exception('Unable to find a certificate for %s' % (hostname))
+
+        not_before_str = cert.get("notBefore")
+        not_after_str = cert.get("notAfter")
+
+        def parse_dt(s: str) -> datetime:
+            # format like 'Jan  1 00:00:00 2025 GMT'
+            return datetime.strptime(s, "%b %d %H:%M:%S %Y %Z")
+
+        not_before = parse_dt(str(not_before_str)) if not_before_str else None
+        not_after = parse_dt(str(not_after_str)) if not_after_str else None
+
+        days_until_expiry = None
+        if not_after:
+            days_until_expiry = (not_after - datetime.utcnow()).days
+
+        # subject / issuer as dicts
+        subject = {str(k): v for ((k, v),) in cert.get("subject", [])} # type: ignore
+        issuer = {str(k): v for ((k, v),) in cert.get("issuer", [])} # type: ignore
+
+        san = []
+        for typ, val in cert.get("subjectAltName", []):
+            san.append({"type": typ, "value": val})
+
+        return CertificateCheckResult(
+            ok=True,
+            hostname=hostname,
+            port=port,
+            not_before=not_before,
+            not_after=not_after,
+            days_until_expiry=days_until_expiry,
+            subject=subject,
+            issuer=issuer,
+            san=san,
+        )
+    except Exception as e:
+        return CertificateCheckResult(
+            ok=False,
+            hostname=hostname,
+            port=port,
+            error=str(e),
+        )
+
+
+def check_hsts(url: str) -> HSTSCheckResult:
+    if not url.startswith("http"):
+        url = "https://" + url
+
+    try:
+        with httpx.Client(timeout=10, follow_redirects=True) as client:
+            resp = client.get(url)
+        hsts = resp.headers.get("Strict-Transport-Security")
+        if not hsts:
+            return HSTSCheckResult(
+                ok=False,
+                url=str(resp.url),
+                hsts_present=False,
+                error="Strict-Transport-Security header not present",
+            )
+
+        # parse basic directives
+        directives = [d.strip() for d in hsts.split(";")]
+        max_age = None
+        include_subdomains = False
+        preload = False
+
+        for d in directives:
+            if d.lower().startswith("max-age"):
+                parts = d.split("=", 1)
+                if len(parts) == 2:
+                    try:
+                        max_age = int(parts[1].strip())
+                    except ValueError:
+                        pass
+            elif d.lower() == "includesubdomains":
+                include_subdomains = True
+            elif d.lower() == "preload":
+                preload = True
+
+        return HSTSCheckResult(
+            ok=True,
+            url=str(resp.url),
+            hsts_present=True,
+            max_age=max_age,
+            include_subdomains=include_subdomains,
+            preload=preload,
+            raw_header=hsts,
+        )
+    except Exception as e:
+        return HSTSCheckResult(
+            ok=False,
+            url=url,
+            hsts_present=False,
+            error=str(e),
+        )
+
+
+def check_http_to_https_redirect(domain: str) -> RedirectCheckResult:
+    # build URLs
+    http_url = f"http://{domain}"
+
+    try:
+        redirect_chain = []
+        with httpx.Client(follow_redirects=True, max_redirects=25, timeout=10) as client:
+            resp = client.get(http_url)
+            for r in resp.history:
+                redirect_chain.append(
+                    {
+                        "status_code": r.status_code,
+                        "url": str(r.url),
+                        "headers": dict(r.headers),
+                    }
+                )
+            final_url = str(resp.url)
+
+        redirected = final_url.startswith("https://")
+
+        return RedirectCheckResult(
+            ok=redirected,
+            http_url=http_url,
+            redirected=redirected,
+            final_url=final_url,
+            status_code=resp.status_code,
+            redirect_chain=redirect_chain,
+            error=None if redirected else "Did not end up on HTTPS",
+        )
+    except Exception as e:
+        return RedirectCheckResult(
+            ok=False,
+            http_url=http_url,
+            redirected=False,
+            error=str(e),
+        )
+
+
+# ---------- Endpoints ----------
+
+@app.get("/check-certificate", response_model=CertificateCheckResult)
+def api_check_certificate(
+    host: str = Query(..., description="Hostname (e.g. example.com)"),
+    port: int = Query(443, description="Port, default 443"),
+):
+    """
+    Check if the TLS certificate is valid, not expired, and matches the hostname.
+    """
+    return get_certificate(host, port)
+
+
+@app.get("/check-hsts", response_model=HSTSCheckResult)
+def api_check_hsts(
+    url: str = Query(..., description="URL or domain (e.g. https://example.com or example.com)"),
+):
+    """
+    Check if HSTS is configured correctly and return max-age / flags.
+    """
+    return check_hsts(url)
+
+
+@app.get("/check-redirect", response_model=RedirectCheckResult)
+def api_check_redirect(
+    domain: str = Query(..., description="Domain without scheme, e.g. example.com"),
+):
+    """
+    Check if HTTP -> HTTPS redirect is working correctly.
+    """
+    return check_http_to_https_redirect(domain)
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+# ---------- Models ----------
+
+class DNSQueryResult(BaseModel):
+    ok: bool
+    domain: str
+    record_type: str
+    answers: Optional[list] = None
+    error: Optional[str] = None
+
+
+class WhoisResult(BaseModel):
+    ok: bool
+    domain: str
+    raw: Optional[str] = None
+    parsed: Optional[dict] = None
+    error: Optional[str] = None
+
+
+# ---------- DNS Query Tool ----------
+
+def dns_query(domain: str, record_type: str = "A", resolver_ip: str | None = None) -> DNSQueryResult:
+    try:
+        resolver = dns.resolver.Resolver()
+        resolver.timeout = 5
+        resolver.lifetime = 5
+        if resolver_ip:
+            resolver.nameservers = [resolver_ip]
+
+        result = [r.to_text() for r in resolver.resolve(domain, record_type)]
+
+        return DNSQueryResult(
+            ok=True,
+            domain=domain,
+            record_type=record_type,
+            answers=result,
+        )
+    except Exception as e:
+        return DNSQueryResult(
+            ok=False,
+            domain=domain,
+            record_type=record_type,
+            error=str(e),
+        )
+
+
+# ---------- WHOIS Tool ----------
+
+def whois_lookup(domain: str) -> WhoisResult:
+    try:
+        data = whois.whois(domain, inc_raw=True)
+
+        # python-whois returns a dict-like object
+        parsed = {k: v for k, v in data.items() if k != 'raw'}
+
+        return WhoisResult(
+            ok=True,
+            domain=domain,
+            raw=str(data.text) if hasattr(data, "text") else None, # type: ignore
+            parsed=parsed,
+        )
+    except Exception as e:
+        return WhoisResult(
+            ok=False,
+            domain=domain,
+            error=str(e),
+        )
+
+
+# ---------- Endpoints ----------
+
+@app.get("/dns-query", response_model=DNSQueryResult)
+def api_dns_query(
+    domain: str = Query(..., description="Domain to query"),
+    record_type: str = Query("A", description="DNS record type (A, AAAA, MX, TXT, etc.)"),
+    resolver_ip: Optional[str] = None,
+):
+    """
+    DNS proxy: performs DNS queries for any record type.
+    """
+    return dns_query(domain, record_type.upper(), resolver_ip)
+
+
+@app.get("/whois", response_model=WhoisResult)
+def api_whois(
+    domain: str = Query(..., description="Domain to perform WHOIS lookup on"),
+):
+    """
+    WHOIS proxy: returns raw and parsed WHOIS data.
+    """
+    return whois_lookup(domain)
+
+class DNSSECResult(BaseModel):
+    ok: bool
+    domain: str
+    validated: bool = False
+    dnskey: Optional[str] = None
+    rrsig: Optional[str] = None
+    error: Optional[str] = None
+
+
+class ReverseDNSResult(BaseModel):
+    ok: bool
+    ip: str
+    ptr: Optional[str] = None
+    error: Optional[str] = None
+
+
+class AXFRResult(BaseModel):
+    ok: bool
+    domain: str
+    soa: Optional[str] = None
+    axfr_allowed: bool = False
+    records: Optional[list] = None
+    error: Optional[str] = None
+
+def dnssec_validate(domain: str, resolver_ip: str | None = None) -> DNSSECResult:
+    import dns.rdatatype
+    import dns.resolver
+    import dns.message
+    import dns.query
+    import dns.name
+    import dns.dnssec
+    import dns.exception
+
+    dnskey = None
+    rrsig = None
+
+    try:
+        resolver = dns.resolver.Resolver()
+        resolver.timeout = 5
+        resolver.lifetime = 5
+        if resolver_ip:
+            resolver.nameservers = [resolver_ip]
+
+        response = resolver.resolve(domain, rdtype=dns.rdatatype.NS)
+
+        # use the first NS
+        ns_server = response[0].to_text() # type: ignore
+        response = dns.resolver.resolve(str(ns_server), rdtype=dns.rdatatype.A)
+        ns_address = response[0].to_text() # type: ignore
+
+        # get DNSKEY for zone
+        request = dns.message.make_query(
+            domain, dns.rdatatype.DNSKEY, want_dnssec=True)
+
+        # set a longer timeout (in seconds)
+        timeout = 20
+
+        # try DNSSEC validation with retries
+        for i in range(3):
+            try:
+                # send the query to the master NS
+                response = dns.query.udp(request, ns_address, timeout=timeout)
+                if response.rcode() != 0:
+                    raise Exception("ERROR: no DNSKEY record found or SERVEFAIL")
+
+                # find an RRSET for the DNSKEY record
+                answer = response.answer
+                if len(answer) != 2:
+                    raise Exception("ERROR: could not find RRSET record (DNSKEY and RR DNSKEY) in zone")
+
+                dnskey = answer[0].to_text()
+                rrsig = answer[1].to_text()
+
+                # check if is the DNSKEY record signed, RRSET validation
+                name = dns.name.from_text(domain)
+                dns.dnssec.validate(answer[0], answer[1], {name: answer[0]})
+
+                break
+
+            except dns.exception.Timeout:
+                # retry on timeout
+                if i == 2:
+                    raise Exception("ERROR: DNSSEC validation failed after retries")
+                    return result
+            except dns.exception.ValidationFailure:
+                raise Exception("CRITICAL: this domain is not likely signed by dnssec")
+
+        return DNSSECResult(
+            ok=True,
+            domain=domain,
+            validated=True,
+            dnskey=dnskey,
+            rrsig=rrsig,
+        )
+
+    except Exception as e:
+        return DNSSECResult(
+            ok=False,
+            domain=domain,
+            validated=False,
+            dnskey=dnskey,
+            rrsig=rrsig,
+            error=str(e),
+        )
+
+def reverse_dns(ip: str, resolver_ip: str | None = None) -> ReverseDNSResult:
+    try:
+        rev = dns.reversename.from_address(ip)
+        resolver = dns.resolver.Resolver()
+        resolver.timeout = 5
+        resolver.lifetime = 5
+        if resolver_ip:
+            resolver.nameservers = [resolver_ip]
+
+        ptr = [r.to_text() for r in resolver.resolve(rev, "PTR")][0]
+
+        return ReverseDNSResult(
+            ok=True,
+            ip=ip,
+            ptr=ptr,
+        )
+    except Exception as e:
+        return ReverseDNSResult(
+            ok=False,
+            ip=ip,
+            error=str(e),
+        )
+
+def soa_axfr_test(domain: str, resolver_ip: str | None = None) -> AXFRResult:
+    try:
+        resolver = dns.resolver.Resolver()
+        resolver.timeout = 5
+        resolver.lifetime = 5
+        if resolver_ip:
+            resolver.nameservers = [resolver_ip]
+
+        # SOA record
+        soa_text = [r.to_text() for r in resolver.resolve(domain, "SOA")][0]
+
+        # Try AXFR
+        nameserver = [r.to_text() for r in resolver.resolve(domain, "NS")][0]
+        zone = dns.zone.from_xfr(dns.query.xfr(nameserver, domain, timeout=5))
+
+        records = []
+        for name, node in zone.nodes.items():
+            for rdataset in node.rdatasets:
+                for rdata in rdataset:
+                    records.append(f"{name} {rdataset.rdtype} {rdata}")
+
+        return AXFRResult(
+            ok=True,
+            domain=domain,
+            soa=soa_text,
+            axfr_allowed=True,
+            records=records,
+        )
+
+    except ValueError:
+        # AXFR refused but SOA succeeded
+        return AXFRResult(
+            ok=True,
+            domain=domain,
+            soa=soa_text,
+            axfr_allowed=False,
+            records=None,
+            error="AXFR refused by server",
+        )
+    except Exception as e:
+        return AXFRResult(
+            ok=False,
+            domain=domain,
+            error=str(e),
+        )
+
+@app.get("/dnssec", response_model=DNSSECResult)
+def api_dnssec(domain: str = Query(...), resolver_ip: Optional[str] = None):
+    return dnssec_validate(domain, resolver_ip)
+
+
+@app.get("/reverse-dns", response_model=ReverseDNSResult)
+def api_reverse_dns(ip: str = Query(...), resolver_ip: Optional[str] = None):
+    return reverse_dns(ip, resolver_ip)
+
+
+@app.get("/soa-axfr", response_model=AXFRResult)
+def api_soa_axfr(domain: str = Query(...), resolver_ip: Optional[str] = None):
+    return soa_axfr_test(domain, resolver_ip)
+
+import uvicorn
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", log_level="info")
