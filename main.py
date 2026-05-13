@@ -14,8 +14,18 @@ import dns.query
 import dns.exception
 import whois
 from fastapi import HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+import os
 
 app = FastAPI(title="Network Utilities Service")
+
+if not os.getenv("DISABLE_CORS"):
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 # ---------- Models ----------
 

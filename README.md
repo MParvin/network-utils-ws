@@ -25,6 +25,10 @@ The service exposes clean JSON APIs suitable for automation, monitoring, and sec
 - **SOA + AXFR zone transfer test**  
 - **Built‑in `/health` endpoint** for container orchestration  
 
+## CORS enabled by default
+
+CORS "*" is enabled by default. You can disable it by setting `DISABLE_CORS=true` environment variable.
+
 ## **Running in Docker**
 
 Pull latest image:
