@@ -29,6 +29,10 @@ The service exposes clean JSON APIs suitable for automation, monitoring, and sec
 
 CORS "*" is enabled by default. You can disable it by setting `DISABLE_CORS=true` environment variable.
 
+## Requests timeout
+
+DNS/HTTP Query timeout can be controlled by setting `REQUEST_TIMEOUT=XXX` environment variable.
+
 ## **Running in Docker**
 
 Pull latest image:

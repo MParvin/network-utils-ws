@@ -19,6 +19,8 @@ import os
 
 app = FastAPI(title="Network Utilities Service")
 
+request_timeout = int(os.getenv("REQUEST_TIMEOUT", "25"))
+
 if not os.getenv("DISABLE_CORS"):
     app.add_middleware(
         CORSMiddleware,
@@ -72,7 +74,7 @@ def get_certificate(hostname: str, port: int = 443) -> CertificateCheckResult:
     ctx.verify_mode = ssl.CERT_REQUIRED
 
     try:
-        with socket.create_connection((hostname, port), timeout=10) as sock:
+        with socket.create_connection((hostname, port), timeout=request_timeout) as sock:
             with ctx.wrap_socket(sock, server_hostname=hostname) as ssock:
                 cert = ssock.getpeercert()
 
@@ -126,7 +128,7 @@ def check_hsts(url: str) -> HSTSCheckResult:
         url = "https://" + url
 
     try:
-        with httpx.Client(timeout=10, follow_redirects=True) as client:
+        with httpx.Client(timeout=request_timeout, follow_redirects=True) as client:
             resp = client.get(url)
         hsts = resp.headers.get("Strict-Transport-Security")
         if not hsts:
@@ -180,7 +182,7 @@ def check_http_to_https_redirect(domain: str) -> RedirectCheckResult:
 
     try:
         redirect_chain = []
-        with httpx.Client(follow_redirects=True, max_redirects=25, timeout=10) as client:
+        with httpx.Client(follow_redirects=True, max_redirects=25, timeout=request_timeout) as client:
             resp = client.get(http_url)
             for r in resp.history:
                 redirect_chain.append(
@@ -271,8 +273,8 @@ class WhoisResult(BaseModel):
 def dns_query(domain: str, record_type: str = "A", resolver_ip: str | None = None) -> DNSQueryResult:
     try:
         resolver = dns.resolver.Resolver()
-        resolver.timeout = 5
-        resolver.lifetime = 5
+        resolver.timeout = request_timeout
+        resolver.lifetime = request_timeout
         if resolver_ip:
             resolver.nameservers = [resolver_ip]
 
@@ -377,8 +379,8 @@ def dnssec_validate(domain: str, resolver_ip: str | None = None) -> DNSSECResult
 
     try:
         resolver = dns.resolver.Resolver()
-        resolver.timeout = 5
-        resolver.lifetime = 5
+        resolver.timeout = request_timeout
+        resolver.lifetime = request_timeout
         if resolver_ip:
             resolver.nameservers = [resolver_ip]
 
@@ -394,7 +396,7 @@ def dnssec_validate(domain: str, resolver_ip: str | None = None) -> DNSSECResult
             domain, dns.rdatatype.DNSKEY, want_dnssec=True)
 
         # set a longer timeout (in seconds)
-        timeout = 20
+        timeout = 30
 
         # try DNSSEC validation with retries
         for i in range(3):
@@ -448,8 +450,8 @@ def reverse_dns(ip: str, resolver_ip: str | None = None) -> ReverseDNSResult:
     try:
         rev = dns.reversename.from_address(ip)
         resolver = dns.resolver.Resolver()
-        resolver.timeout = 5
-        resolver.lifetime = 5
+        resolver.timeout = request_timeout
+        resolver.lifetime = request_timeout
         if resolver_ip:
             resolver.nameservers = [resolver_ip]
 
@@ -470,8 +472,8 @@ def reverse_dns(ip: str, resolver_ip: str | None = None) -> ReverseDNSResult:
 def soa_axfr_test(domain: str, resolver_ip: str | None = None) -> AXFRResult:
     try:
         resolver = dns.resolver.Resolver()
-        resolver.timeout = 5
-        resolver.lifetime = 5
+        resolver.timeout = request_timeout
+        resolver.lifetime = request_timeout
         if resolver_ip:
             resolver.nameservers = [resolver_ip]
 
@@ -480,7 +482,7 @@ def soa_axfr_test(domain: str, resolver_ip: str | None = None) -> AXFRResult:
 
         # Try AXFR
         nameserver = [r.to_text() for r in resolver.resolve(domain, "NS")][0]
-        zone = dns.zone.from_xfr(dns.query.xfr(nameserver, domain, timeout=5))
+        zone = dns.zone.from_xfr(dns.query.xfr(nameserver, domain, timeout=request_timeout))
 
         records = []
         for name, node in zone.nodes.items():
