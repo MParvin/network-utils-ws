@@ -1,0 +1,47 @@
+services:
+  network-utils:
+    image: mparvin/network-utils:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: network-utils-ws
+    ports:
+      - "8000:8000"
+    environment:
+      # Request timeout for DNS/HTTP queries (seconds)
+      REQUEST_TIMEOUT: 25
+      # Set to 'true' to disable CORS (default: enabled)
+      DISABLE_CORS: "false"
+      # Python environment
+      PYTHONDONTWRITEBYTECODE: 1
+      PYTHONUNBUFFERED: 1
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    # Optional: resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 512M
+        reservations:
+          cpus: "0.5"
+          memory: 256M
+    # Optional: for development, uncomment to mount source code
+    # volumes:
+    #   - .:/app
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# Network configuration
+networks:
+  default:
+    name: network-utils-network
+    driver: bridge
